@@ -34,7 +34,12 @@ Requires LÖVE 11.x. Built and verified against 11.5 on Windows.
 | `1` `2` `3` `4` | isolate direct / SSGI / AO / SSR |
 | `5` `6` `7` `8` | albedo / normals / depth / roughness |
 | `A` `G` `R` | toggle AO / GI / SSR |
+| `F2` `F3` `F4` | ray-traced shadows / AO / reflections (needs the rayquery build) |
+| `T` | all three ray-traced passes at once |
 | `TAB` | path-traced reference |
+| `N` | denoised path tracing — 1 spp + SVGF-lite, stable under camera motion |
+| `V` | denoiser debug views (raw 1 spp / variance / history / albedo / normals) |
+| `B` | spin the tall block — a per-frame TLAS refit, hardware path only |
 | `C` | A/B wipe — full render left, direct-only right, follows the mouse |
 | `O` | slow auto-orbit |
 | `[` `]` | render scale (0.25×–2×) |
@@ -44,7 +49,52 @@ Requires LÖVE 11.x. Built and verified against 11.5 on Windows.
 | `F5` | screenshot |
 | `F1` | hide help |
 
-Command line: `--shot N`, `--mode N`, `--pt`, `--scale F`, `--nohud` (used for automated captures).
+Command line: `--shot N`, `--mode N`, `--pt`, `--scale F`, `--nohud` (used for automated captures),
+plus `--hw` (hardware ray queries, see HARDWARE_RAYTRACING.md), `--dn` (denoised mode),
+`--dnview N`, `--orbit`, `--anim` (block motion), `--bench N`, `--bounces N`, `--tag S`.
+
+## A scene that moves
+
+`B` in the hardware path traced view spins the tall block. It is the only
+dynamic object, and it is dynamic in the way real engines do it: the block
+lives in its **own bottom-level acceleration structure**, built once in local
+space, and its placement is an instance transform in the top-level structure.
+Each frame of motion is one `tlas:update()` — a refit costing a fraction of a
+millisecond — while the walls, sphere and emitter structures are never touched
+([rt_scene.lua](rt_scene.lua)). The denoiser rides through it: the moving
+block's freshly disoccluded pixels fall back to spatial filtering for a few
+frames while everything else keeps its full history.
+
+The SDF renderers deliberately do not know the block can move — their scene is
+a compiled-in distance function. The static scene stays bit-for-bit what it
+always was, so every SDF-vs-hardware comparison in HARDWARE_RAYTRACING.md
+still holds; motion is where the hardware path stops having an SDF twin at all.
+
+## Denoised path tracing
+
+`N` inside the path traced view (or `--dn`) switches from accumulate-and-reset to
+**1 sample per pixel + SVGF-lite**: the tracer also writes first-hit guides
+(normal, depth, albedo), a reprojection pass carries the accumulated history
+through camera motion instead of discarding it, per-pixel variance is tracked from
+luminance moments, and five edge-aware à-trous iterations filter what noise
+remains — on demodulated irradiance, so albedo detail is never at risk. The result
+converges in place while you orbit ([reproject.glsl](shaders/reproject.glsl),
+[variance.glsl](shaders/variance.glsl), [atrous.glsl](shaders/atrous.glsl),
+[dnresolve.glsl](shaders/dnresolve.glsl)).
+
+Denoised 1 spp lands within ~1.2% mean absolute difference of the 600-spp
+reference on a still camera, at 92 fps at 2560×1440 with hardware rays (52 fps
+with the SDF marcher).
+
+The mirror sphere gets its own reprojection: reflected content does not live
+on the mirror's surface, it lives at the reflected hit distance behind it, so
+the tracer reports that distance and the reprojection pass tracks the
+**virtual point** instead of the surface — validated by material identity
+rather than surface depth, which is meaningless there. That is what keeps the
+sphere's reflections crisp mid-orbit instead of smearing.
+
+Known limit worth knowing: silhouette edges keep a little speckle — jittered
+edge pixels alternate between surfaces and never build history.
 
 ## The pipeline
 
@@ -71,6 +121,33 @@ directly. It removes a whole class of convention bugs.
 that has already bounced once is available to bounce again. The effective bounce count
 grows with the accumulation rather than with the per-frame cost — which is why the colour
 bleed keeps deepening for a second or so after you stop moving.
+
+## The hybrid pipeline: same passes, real rays
+
+On the rayquery LÖVE build, `T` swaps the deferred pipeline's three
+screen-space visibility tricks for hardware ray queries — individually
+toggleable (`F2`/`F3`/`F4`) so each screen-space failure mode can be A/B'd
+live against its fix:
+
+* **RT shadows** ([light_hw.glsl](shaders/light_hw.glsl)) — the 56-step
+  soft-shadow march becomes one `TerminateOnFirstHit` ray per sample; softness
+  comes from the jittered area light plus accumulation, exactly as in the path
+  tracer.
+* **RTAO** ([rtao.glsl](shaders/rtao.glsl)) — 8 short hemisphere rays ask the
+  scene instead of the depth buffer; no self-view blindness, no halos.
+* **RT reflections** ([ssr_hw.glsl](shaders/ssr_hw.glsl)) — the same GGX lobe
+  and BRDF weight as SSR, but the ray is traced against the TLAS: no screen-edge
+  fade, no reflections dying when their subject leaves the frame, and hits are
+  shaded with real next-event estimation. The isolated view (`4`) makes the
+  difference plain on the sphere's lower half, which reflects geometry SSR
+  cannot see.
+
+The pipelines share everything else, so the comparison is visibility source
+and nothing more ([rq_common.glsl](shaders/rq_common.glsl) holds the shared
+trace helpers). **The price of the whole swap is approximately nothing**:
+2.61 ms ray-traced vs 2.54 ms screen-space at 1280×720, and at 2560×1440 the
+ray-traced pipeline is marginally *faster* (15.59 vs 15.84 ms) — one ray query
+outruns a 40-step depth-buffer march with binary refinement.
 
 ## What the comparison actually shows
 

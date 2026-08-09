@@ -45,12 +45,24 @@ vec3 sampleEmitterNEE(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, float me
 	return (diff + spec) * LIGHT_E * (NoL * lnl * LIGHT_AREA / max(d2, 1e-4));
 }
 
-vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
-	uint seed = seedPixel(love_PixelCoord.xy, uFrame);
-
-	vec2 uv = (love_PixelCoord.xy + rnd2(seed)) / uRes;
+// The integrator, one sample. The entry point lives in a driver snippet that
+// main.lua appends: the reference driver additively accumulates the radiance,
+// the denoiser driver also wants the first hit's normal, view depth, albedo
+// and material id as guide data, so they are returned here. Capturing them
+// adds no rnd() calls -- the sample sequence is identical either way, which
+// is what keeps the reference images bit-stable across this refactor.
+vec3 pathtracePixel(vec2 uv, inout uint seed,
+                    out vec3 gN, out float gZ, out vec3 gAlb, out float gId,
+                    out float gReflT) {
 	vec3 ro = uCamPos;
 	vec3 rd = rayDir(uv);
+
+	// Miss defaults, matching the G-buffer's conventions. Albedo is 1 so the
+	// denoiser's demodulation is a no-op where there is no surface. gReflT is
+	// the mirror-bounce hit distance -- how far BEHIND a pure-specular first
+	// hit its reflected content lives -- which the denoiser reprojects with.
+	gN = -rd; gZ = 1e6; gAlb = vec3(1.0); gId = -1.0; gReflT = 0.0;
+	bool firstPure = false;
 
 	vec3 radiance   = vec3(0.0);
 	vec3 throughput = vec3(1.0);
@@ -63,6 +75,8 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 		float t, id;
 		if (!trace(ro, rd, 40.0, t, id)) break;         // escaped through the open face
 
+		if (b == 1 && firstPure) gReflT = t;
+
 		vec3 P = ro + rd * t;
 		vec3 N = calcNormal(P);
 		if (dot(N, -rd) < 0.0) N = -N;
@@ -71,12 +85,22 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 		vec3 albedo, emis; float rough, metal;
 		getMaterial(id, albedo, rough, metal, emis);
 
+		if (b == 0) {
+			gN = N;
+			gZ = dot(P - uCamPos, uCamFwd);
+			// The emitter's albedo is black; demodulating emission by it would
+			// blow up, so the light keeps an albedo of 1 in the guide buffer.
+			gAlb = (id > 4.5) ? vec3(1.0) : albedo;
+			gId = id;
+		}
+
 		if (id > 4.5) {                                  // hit the emitter
 			if (specularPath) radiance += throughput * emis;
 			break;
 		}
 
 		bool pureSpec = (metal > 0.5 && rough < 0.12);
+		if (b == 0) firstPure = pureSpec;
 
 		if (!pureSpec) {
 			radiance += throughput * sampleEmitterNEE(P, N, V, albedo, rough, metal, seed);
@@ -123,6 +147,5 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 		}
 	}
 
-	radiance = min(radiance, vec3(60.0));   // clamp fireflies
-	return vec4(radiance, 1.0);             // alpha accumulates the sample count
+	return min(radiance, vec3(60.0));       // clamp fireflies
 }

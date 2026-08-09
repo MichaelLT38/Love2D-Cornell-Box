@@ -138,6 +138,14 @@ end
 -- build
 ---------------------------------------------------------------------------
 
+-- The tall block's placement, matching mapEx. It lives in its OWN instance
+-- so the placement is a TLAS transform rather than baked vertices -- which is
+-- what lets rt.setBlockAngle spin it per frame with tlas:update() instead of
+-- rebuilding anything.
+local BLOCK_C = { -0.38, -0.40, -0.30 }
+local BLOCK_H = {  0.28,  0.60,  0.28 }
+local BLOCK_A = 0.29
+
 local function buildScene()
 	local s = newSoup()
 	addBox(s, {  0.00, -1.05,  0.00 }, { 1.10, 0.05, 1.10 }, M_FLOOR)  -- floor
@@ -145,10 +153,29 @@ local function buildScene()
 	addBox(s, {  0.00,  0.00, -1.05 }, { 1.10, 1.10, 0.05 }, M_WHITE)  -- back
 	addBox(s, { -1.05,  0.00,  0.00 }, { 0.05, 1.00, 1.05 }, M_RED)    -- left
 	addBox(s, {  1.05,  0.00,  0.00 }, { 0.05, 1.00, 1.05 }, M_GREEN)  -- right
-	addBox(s, { -0.38, -0.40, -0.30 }, { 0.28, 0.60, 0.28 }, M_WHITE,  0.29) -- tall block
+	-- tall block is its own instance now, see buildBlock
 	addBox(s, {  0.38, -0.70,  0.26 }, { 0.30, 0.30, 0.30 }, M_WHITE, -0.32) -- short block
 	addSphere(s, { 0.38, -0.14, 0.26 }, 0.26, M_METAL)                  -- chrome sphere
 	return s
+end
+
+-- The tall block in LOCAL space: centred on the origin, unrotated. Placement
+-- and spin are entirely the instance transform's job.
+local function buildBlock()
+	local s = newSoup()
+	addBox(s, { 0, 0, 0 }, BLOCK_H, M_WHITE)
+	return s
+end
+
+--- The block's instance transform for a spin of `extra` radians on top of its
+--- resting angle. Row-major 3x4, same rotation convention as xform(): world =
+--- centre + rotY(local, -(angle)) expressed as a matrix.
+function rt.blockTransform(extra)
+	local a = BLOCK_A + (extra or 0)
+	local c, s = math.cos(a), math.sin(a)
+	return {  c, 0, s, BLOCK_C[1],
+	          0, 1, 0, BLOCK_C[2],
+	         -s, 0, c, BLOCK_C[3] }
 end
 
 local function buildEmitter()
@@ -180,38 +207,67 @@ function rt.build()
 	end
 
 	local ok, res = pcall(function()
-		local scene, emitter = buildScene(), buildEmitter()
+		local scene, emitter, block = buildScene(), buildEmitter(), buildBlock()
 
 		local scenePos = vec4Buffer(scene.pos)
 		local sceneNrm = vec4Buffer(scene.nrm)
 		local sceneMat = love.graphics.newBuffer(
 			{ { name = "m", location = 0, format = "float" } }, scene.mat,
 			{ shaderstorage = true, usage = "static" })
-		local emitPos = vec4Buffer(emitter.pos)
+		local emitPos  = vec4Buffer(emitter.pos)
+		local blockPos = vec4Buffer(block.pos)
+		local blockNrm = vec4Buffer(block.nrm)
 
+		-- All three bottom levels are static geometry (the block MOVES by
+		-- instance transform, its triangles never change), so all three are
+		-- compacted: a one-time build stall for smaller structures all run.
+		-- On builds whose wrap layer predates the option it is ignored.
 		local sceneBlas = love.graphics.newAccelerationStructure("bottom", {
 			{ vertexbuffer = scenePos, vertexcount = scene.tris * 3, vertexstride = 16 },
-		}, { debugname = "cornell scene" })
+		}, { compact = true, debugname = "cornell scene" })
 
 		local emitBlas = love.graphics.newAccelerationStructure("bottom", {
 			{ vertexbuffer = emitPos, vertexcount = emitter.tris * 3, vertexstride = 16 },
-		}, { debugname = "cornell emitter" })
+		}, { compact = true, debugname = "cornell emitter" })
+
+		local blockBlas = love.graphics.newAccelerationStructure("bottom", {
+			{ vertexbuffer = blockPos, vertexcount = block.tris * 3, vertexstride = 16 },
+		}, { compact = true, debugname = "cornell tall block" })
 
 		-- Instance masks are the `map` / `mapOcc` split. Bit 0 is "occludes";
 		-- the emitter does not set it, so a shadow ray issued with cull mask
 		-- 0x01 never sees the light, exactly as mapOcc drops it from the union.
-		local tlas = love.graphics.newAccelerationStructure("top", {
-			{ sceneBlas, customindex = 0, mask = 0x01 },
-			{ emitBlas,  customindex = 1, mask = 0x02 },
-		}, { debugname = "cornell tlas" })
+		-- The block occludes like the rest of the scene.
+		local function instanceList(extra)
+			return {
+				{ sceneBlas, customindex = 0, mask = 0x01 },
+				{ emitBlas,  customindex = 1, mask = 0x02 },
+				{ blockBlas, customindex = 2, mask = 0x01, transform = rt.blockTransform(extra) },
+			}
+		end
 
-		return {
-			tlas = tlas, blas = { sceneBlas, emitBlas },
+		-- updatable so setBlockAngle can refit it per frame. On a build whose
+		-- wrap layer predates the option this is silently ignored and the
+		-- update method simply does not exist -- canAnimate says which.
+		local tlas = love.graphics.newAccelerationStructure("top", instanceList(0),
+			{ updatable = true, debugname = "cornell tlas" })
+
+		local result = {
+			tlas = tlas, blas = { sceneBlas, emitBlas, blockBlas },
 			pos = scenePos, nrm = sceneNrm, mat = sceneMat, emitPos = emitPos,
-			tris = scene.tris + emitter.tris,
+			blockNrm = blockNrm, blockPos = blockPos,
+			tris = scene.tris + emitter.tris + block.tris,
 			sceneTris = scene.tris,
-			bytes = sceneBlas:getSize() + emitBlas:getSize() + tlas:getSize(),
+			bytes = sceneBlas:getSize() + emitBlas:getSize() + blockBlas:getSize() + tlas:getSize(),
+			canAnimate = tlas.update ~= nil,
 		}
+
+		--- Spin the tall block: one TLAS refit, nothing rebuilt.
+		function result.setBlockAngle(extra)
+			tlas:update(instanceList(extra))
+		end
+
+		return result
 	end)
 
 	if not ok then return nil, tostring(res) end

@@ -46,8 +46,11 @@ Roughly **2,200 primitive evaluations per bounce** in shader ALU, replaced by
 two ray queries in dedicated traversal hardware.
 
 `rt_scene.lua` transcribes `mapEx()` into triangles: **4,064 triangles**
-(5 wall slabs, 2 rotated blocks, a 64×32 sphere, the emitter quad) and
-**648 KB** of acceleration structures.
+(5 wall slabs, 2 rotated blocks, a 64×32 sphere, the emitter quad). The
+build-time estimate allocates **648 KB** of acceleration structures;
+compaction (`{ compact = true }`, a one-time build stall that rebuilds each
+bottom level into the size it actually needed) brings the resident total to
+**233 KB**, with a bit-identical image.
 
 The SDF's `map()` / `mapOcc()` split — shadow rays must not stop on the light
 itself — becomes an **instance mask**. The emitter is its own instance and does
@@ -127,6 +130,32 @@ stating rather than hiding. With a single primary ray there is nothing to
 amortise the acceleration structure against, both paths are sitting on the
 2.06 ms floor, and the difference is inside the noise there. The advantage
 appears at two bounces and is decisive by three.
+
+## The same rays, inside the deferred pipeline
+
+The comparison above pits two whole path tracers against each other. The
+sharper deployment turned out to be surgical: the deferred pipeline's
+screen-space shadows, AO and reflections each have a ray-traced variant
+(`F2`/`F3`/`F4`, or `T` for all three) that swaps only the visibility query
+and keeps every other line of the pass. Measured cost of going fully
+ray-traced: **approximately zero** — 2.61 vs 2.54 ms at 1280×720, and
+marginally faster than screen space at 2560×1440, because one ray query
+replaces a 40-step depth-buffer march. The README's hybrid-pipeline section
+has the details.
+
+## Compute shaders can trace too
+
+`#pragma rayquery` is not pixel-shader-only. A five-ray probe against a single
+triangle — three hits at t = 2.0, two misses — returns identical results from a
+`computemain()` shader dispatched through `love.graphics.dispatchThreadgroups`,
+with the TLAS and a writable storage buffer bound the same way as anywhere
+else (verified 2026-08-09, same GPU). This matters for what comes next: a
+denoiser or a wavefront-style tracer wants compute passes, and nothing in the
+plumbing stands in the way.
+
+One footgun the probe stepped on: a ray that passes exactly through a triangle
+edge may legitimately resolve as hit *or* miss under watertight traversal
+rules. Test rays belong strictly inside or strictly outside.
 
 ## Caveats
 

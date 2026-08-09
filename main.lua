@@ -46,6 +46,19 @@ local S = {
 	autoOrbit = false,
 	showHelp  = true,
 	pathTrace = false,
+	denoise   = false,   -- path traced view: SVGF-lite instead of accumulation
+	dnView    = 0,       -- denoiser debug view, see dnresolve.glsl
+	animate   = false,   -- spin the tall block via TLAS refit (hw path only)
+	-- Deferred pipeline, per-effect: real rays instead of screen space.
+	rtShadows = false,
+	rtAO      = false,
+	rtRefl    = false,
+}
+local animTime = 0
+
+local DN_VIEW_NAMES = {
+	[0] = "denoised", [1] = "raw 1 spp", [2] = "variance",
+	[3] = "history length", [4] = "albedo", [5] = "normals",
 }
 
 local MODE_NAMES = {
@@ -72,6 +85,10 @@ local camKey = ""
 local frame     = 0     -- monotonic, only feeds the RNG
 local accFrames = 0     -- samples merged into the accumulation buffers
 local ptSamples = 0
+
+-- Last frame's camera, for the denoiser's temporal reprojection. nil until
+-- the first denoised frame has run.
+local prevCam = nil
 
 -- Hardware ray tracing. `rtScene` holds the acceleration structures and the
 -- buffers the shader reads; nil means this build or this GPU cannot do it, and
@@ -153,11 +170,24 @@ local function resetAccum()
 			love.graphics.setCanvas()
 		end
 	end
+	-- Zeroed history data means histLen 0, which the reprojection pass treats
+	-- as "no history"; zeroed nrmZ fails its depth test. No reset flag needed.
+	if cv.dn then
+		for i = 1, 2 do
+			love.graphics.setCanvas(cv.dn.histData[i])
+			love.graphics.clear(0, 0, 0, 0)
+			love.graphics.setCanvas(cv.dn.nrmZ[i])
+			love.graphics.clear(0, 0, 0, 0)
+			love.graphics.setCanvas()
+		end
+		prevCam = nil
+	end
 end
 
 local function settingsKey()
 	return table.concat({
 		tostring(S.ao), tostring(S.gi), tostring(S.ssr),
+		tostring(S.rtShadows), tostring(S.rtAO), tostring(S.rtRefl),
 		S.aoRadius, S.aoPower, S.aoSamples,
 		S.giRays, S.giSteps, S.giRadius, S.giStrength,
 		S.ssrSteps, S.ssrDist, S.ssrThick, S.bounces,
@@ -169,12 +199,43 @@ local setKey = ""
 --  resources
 -- ======================================================================
 
+-- The path tracer files define pathtracePixel() and no entry point; one of
+-- these two drivers is appended. Seed and jitter live here so the rnd()
+-- sequence is identical in both -- the reference images depend on that.
+local DRIVER_ACCUM = [[
+vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
+	uint seed = seedPixel(love_PixelCoord.xy, uFrame);
+	vec2 uv = (love_PixelCoord.xy + rnd2(seed)) / uRes;
+	vec3 n; float z; vec3 alb; float id; float reflT;
+	vec3 rad = pathtracePixel(uv, seed, n, z, alb, id, reflT);
+	return vec4(rad, 1.0);
+}
+]]
+
+-- The denoiser wants the same sample DEMODULATED (albedo divided out, so the
+-- filter works on irradiance and texture detail is never at risk) plus the
+-- first-hit guides. pathtracePixel sets alb = 1 for the emitter and misses,
+-- so the division is a no-op exactly where demodulation makes no sense.
+local DRIVER_DENOISE = [[
+void effect() {
+	uint seed = seedPixel(love_PixelCoord.xy, uFrame);
+	vec2 uv = (love_PixelCoord.xy + rnd2(seed)) / uRes;
+	vec3 n; float z; vec3 alb; float id; float reflT;
+	vec3 rad = pathtracePixel(uv, seed, n, z, alb, id, reflT);
+	// Alpha carries the mirror-bounce hit distance; the reprojection pass
+	// uses it to track reflections by their virtual depth.
+	love_Canvases[0] = vec4(rad / max(alb, vec3(1e-3)), reflT);
+	love_Canvases[1] = vec4(n, z);
+	love_Canvases[2] = vec4(alb, id);
+}
+]]
+
 local function loadShaders()
 	local common = love.filesystem.read("shaders/common.glsl")
-	local function build(name)
+	local function build(name, driver)
 		local body = love.filesystem.read("shaders/" .. name .. ".glsl")
 		assert(body, "missing shaders/" .. name .. ".glsl")
-		local src = "#pragma language glsl3\n" .. common .. "\n" .. body
+		local src = "#pragma language glsl3\n" .. common .. "\n" .. body .. (driver or "")
 		local ok, res = pcall(love.graphics.newShader, src)
 		if not ok then
 			error(("shader '%s' failed to compile:\n%s"):format(name, tostring(res)))
@@ -189,8 +250,14 @@ local function loadShaders()
 	shaders.ssr       = build("ssr")
 	shaders.accum     = build("accum")
 	shaders.composite = build("composite")
-	shaders.pathtrace = build("pathtrace")
+	shaders.pathtrace = build("pathtrace", DRIVER_ACCUM)
 	shaders.ptresolve = build("ptresolve")
+
+	shaders.pathtrace_dn = build("pathtrace", DRIVER_DENOISE)
+	shaders.reproject    = build("reproject")
+	shaders.variance     = build("variance")
+	shaders.atrous       = build("atrous")
+	shaders.dnresolve    = build("dnresolve")
 
 	-- Hardware ray query variant. GLSL 4 rather than 3 because rayQueryEXT
 	-- needs #version 460, and `#pragma rayquery` is what makes love emit the
@@ -198,16 +265,27 @@ local function loadShaders()
 	-- without ray queries just does not get this shader, and the SDF path
 	-- tracer above remains the reference.
 	if rtScene and love.graphics.getSupported().rayquery then
-		local body = love.filesystem.read("shaders/pathtrace_hw.glsl")
-		if body then
-			local src = "#pragma language glsl4\n" .. common .. "\n" .. body
+		local rq = love.filesystem.read("shaders/rq_common.glsl")
+		local function buildHW(name, driver)
+			local body = love.filesystem.read("shaders/" .. name .. ".glsl")
+			if not body or not rq then return nil end
+			local src = "#pragma language glsl4\n" .. common .. "\n" .. rq .. "\n" .. body .. (driver or "")
 			local ok, res = pcall(love.graphics.newShader, src)
-			if ok then
-				shaders.pathtrace_hw = res
-			else
-				rtStatus = "hw shader failed: " .. tostring(res)
+			if not ok then
+				rtStatus = ("hw shader '%s' failed: %s"):format(name, tostring(res))
+				return nil
 			end
+			return res
 		end
+		shaders.pathtrace_hw    = buildHW("pathtrace_hw", DRIVER_ACCUM)
+		shaders.pathtrace_hw_dn = buildHW("pathtrace_hw", DRIVER_DENOISE)
+
+		-- Ray-traced variants of the deferred passes: same pipeline, the
+		-- screen-space visibility swapped for real rays. Each is optional and
+		-- toggleable, so every screen-space failure mode can be A/B'd live.
+		shaders.light_hw = buildHW("light_hw")
+		shaders.rtao     = buildHW("rtao")
+		shaders.ssr_hw   = buildHW("ssr_hw")
 	end
 end
 
@@ -242,6 +320,25 @@ local function buildCanvases()
 
 	cv.pt = newCanvas(RW, RH, "rgba32f")
 
+	-- Denoiser targets, all rgba32f (MRT batches must share a format). Data
+	-- canvases sample nearest; the two history pairs sample linear because
+	-- the reprojected lookup lands between pixels.
+	cv.dn = {
+		color = newCanvas(RW, RH, "rgba32f", "nearest"),   -- raw 1 spp, demodulated
+		alb   = newCanvas(RW, RH, "rgba32f", "nearest"),   -- albedo + material id
+		nrmZ  = { newCanvas(RW, RH, "rgba32f", "nearest"),
+		          newCanvas(RW, RH, "rgba32f", "nearest") },
+		acc   = newCanvas(RW, RH, "rgba32f", "nearest"),   -- reprojected color
+		var   = newCanvas(RW, RH, "rgba32f", "nearest"),   -- color + variance
+		histColor = { newCanvas(RW, RH, "rgba32f", "linear"),
+		              newCanvas(RW, RH, "rgba32f", "linear") },
+		histData  = { newCanvas(RW, RH, "rgba32f", "linear"),
+		              newCanvas(RW, RH, "rgba32f", "linear") },
+		at    = { newCanvas(RW, RH, "rgba32f", "nearest"),
+		          newCanvas(RW, RH, "rgba32f", "nearest") },
+		idx = 1,
+	}
+
 	resetAccum()
 end
 
@@ -260,8 +357,18 @@ local function passGBuffer()
 	love.graphics.setCanvas()
 end
 
+-- Send everything a ray-traced deferred variant needs on top of the G-buffer.
+local function sendTLAS(sh)
+	send(sh, "uTLAS", rtScene.tlas)
+	send(sh, "Verts", rtScene.pos)
+	send(sh, "Norms", rtScene.nrm)
+	send(sh, "Mats",  rtScene.mat)
+	send(sh, "BlockNorms", rtScene.blockNrm)
+end
+
 local function passSSAO()
-	local sh = shaders.ssao
+	local rt = S.rtAO and shaders.rtao and rtScene
+	local sh = rt and shaders.rtao or shaders.ssao
 	love.graphics.setCanvas(cv.aoA)
 	love.graphics.setShader(sh)
 	sendCamera(sh, RW, RH)
@@ -270,6 +377,7 @@ local function passSSAO()
 	send(sh, "uAORadius",  S.aoRadius)
 	send(sh, "uAOPower",   S.aoPower)
 	send(sh, "uAOSamples", S.aoSamples)
+	if rt then sendTLAS(sh) end
 	fullscreen(RW, RH)
 
 	-- two-tap depth-aware blur, horizontal then vertical
@@ -292,10 +400,12 @@ local function passSSAO()
 end
 
 local function passLight(prev)
-	local sh = shaders.light
+	local rt = S.rtShadows and shaders.light_hw and rtScene
+	local sh = rt and shaders.light_hw or shaders.light
 	love.graphics.setCanvas(cv.litD, cv.litG)
 	love.graphics.setShader(sh)
 	sendCamera(sh, RW, RH)
+	if rt then sendTLAS(sh) end
 	send(sh, "gPos", cv.gPos)
 	send(sh, "gNrm", cv.gNrm)
 	send(sh, "gAlb", cv.gAlb)
@@ -314,10 +424,12 @@ local function passLight(prev)
 end
 
 local function passSSR(prev)
-	local sh = shaders.ssr
+	local rt = S.rtRefl and shaders.ssr_hw and rtScene
+	local sh = rt and shaders.ssr_hw or shaders.ssr
 	love.graphics.setCanvas(cv.ssr)
 	love.graphics.setShader(sh)
 	sendCamera(sh, RW, RH)
+	if rt then sendTLAS(sh) end
 	send(sh, "gPos", cv.gPos)
 	send(sh, "gNrm", cv.gNrm)
 	send(sh, "gAlb", cv.gAlb)
@@ -389,6 +501,7 @@ local function passPathTrace()
 		send(sh, "Verts", rtScene.pos)
 		send(sh, "Norms", rtScene.nrm)
 		send(sh, "Mats",  rtScene.mat)
+		send(sh, "BlockNorms", rtScene.blockNrm)
 	end
 	fullscreen(RW, RH)
 	love.graphics.setShader()
@@ -404,6 +517,103 @@ local function passPathTrace()
 	send(r, "uSamples", ptSamples)
 	fullscreen(W, H)
 	love.graphics.setShader()
+end
+
+-- The denoised path traced frame: 1 spp with guides, temporal reprojection,
+-- variance estimate, five a-trous iterations, resolve. The first a-trous
+-- iteration renders into the history color buffer -- SVGF feeds the first
+-- FILTERED image back as next frame's history, which is what keeps the
+-- feedback loop stable at 1 spp.
+local function passDenoise()
+	local hw = useHW and shaders.pathtrace_hw_dn and rtScene
+	local d  = cv.dn
+	local cur, prv = d.idx, 3 - d.idx
+
+	-- 1 spp + guide MRT
+	local sh = hw and shaders.pathtrace_hw_dn or shaders.pathtrace_dn
+	love.graphics.setCanvas(d.color, d.nrmZ[cur], d.alb)
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "uBounces", S.bounces)
+	if hw then
+		send(sh, "uTLAS", rtScene.tlas)
+		send(sh, "Verts", rtScene.pos)
+		send(sh, "Norms", rtScene.nrm)
+		send(sh, "Mats",  rtScene.mat)
+		send(sh, "BlockNorms", rtScene.blockNrm)
+	end
+	fullscreen(RW, RH)
+
+	-- temporal reprojection through last frame's camera
+	sh = shaders.reproject
+	love.graphics.setCanvas(d.acc, d.histData[cur])
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	local pc = prevCam or { camVectors() }
+	send(sh, "texCur",       d.color)
+	send(sh, "texNrmZ",      d.nrmZ[cur])
+	send(sh, "texPrevNrmZ",  d.nrmZ[prv])
+	send(sh, "texHistColor", d.histColor[prv])
+	send(sh, "texHistData",  d.histData[prv])
+	send(sh, "texAlb",       d.alb)
+	send(sh, "uPrevCamPos",   pc[1])
+	send(sh, "uPrevCamRight", pc[2])
+	send(sh, "uPrevCamUp",    pc[3])
+	send(sh, "uPrevCamFwd",   pc[4])
+	send(sh, "uPrevTanHalf",  pc[5] or math.tan(math.rad(cam.fov) * 0.5))
+	send(sh, "uPrevAspect",   pc[6] or RW / RH)
+	send(sh, "uMaxHist",      64)
+	-- 32 rather than the original 8: the reprojection now tracks mirror
+	-- content by its virtual depth, so mirror history is mostly trustworthy.
+	send(sh, "uMetalMaxHist", 32)
+	fullscreen(RW, RH)
+
+	-- variance estimate rides into alpha
+	sh = shaders.variance
+	love.graphics.setCanvas(d.var)
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texColor",    d.acc)
+	send(sh, "texHistData", d.histData[cur])
+	send(sh, "texNrmZ",     d.nrmZ[cur])
+	fullscreen(RW, RH)
+
+	-- five a-trous iterations; the first one is also next frame's history
+	local src = d.var
+	local stepsList = { 1, 2, 4, 8, 16 }
+	sh = shaders.atrous
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texNrmZ",  d.nrmZ[cur])
+	send(sh, "uSigmaL",  4.0)
+	for i, st in ipairs(stepsList) do
+		local dst = (i == 1) and d.histColor[cur] or d.at[i % 2 + 1]
+		love.graphics.setCanvas(dst)
+		send(sh, "texColor", src)
+		send(sh, "uStep", st)
+		fullscreen(RW, RH)
+		src = dst
+	end
+
+	-- remodulate + tonemap to the screen
+	love.graphics.setCanvas()
+	love.graphics.setBlendMode("alpha")
+	sh = shaders.dnresolve
+	love.graphics.setShader(sh)
+	send(sh, "uRes", { W, H })
+	send(sh, "texColor",    src)
+	send(sh, "texAlb",      d.alb)
+	send(sh, "texRaw",      d.color)
+	send(sh, "texHistData", d.histData[cur])
+	send(sh, "texNrmZ",     d.nrmZ[cur])
+	send(sh, "uExposure",   S.exposure)
+	send(sh, "uDnView",     S.dnView)
+	fullscreen(W, H)
+	love.graphics.setShader()
+
+	local p, r, u, f = camVectors()
+	prevCam = { p, r, u, f, math.tan(math.rad(cam.fov) * 0.5), RW / RH }
+	d.idx = prv
 end
 
 -- ======================================================================
@@ -423,7 +633,22 @@ local function drawHUD()
 	love.graphics.setFont(font)
 
 	local lines
-	if S.pathTrace then
+	if S.pathTrace and S.denoise then
+		lines = {
+			("DENOISED PATH TRACING  (1 spp + SVGF-lite%s)")
+				:format((useHW and shaders.pathtrace_hw_dn and rtScene) and ", hw rays" or ""),
+			("view: %s   bounces: %d"):format(DN_VIEW_NAMES[S.dnView] or "?", S.bounces),
+			"",
+			"One new sample per frame. Reprojection keeps the",
+			"history alive while the camera moves; an edge-aware",
+			"wavelet filter eats the noise that remains.",
+			"",
+			"N    accumulation mode     V   cycle debug views",
+			"TAB  real-time renderer    , . bounces",
+			(useHW and rtScene and rtScene.canAnimate)
+				and ("B    block motion: " .. (S.animate and "ON" or "off")) or "",
+		}
+	elseif S.pathTrace then
 		lines = {
 			"PATH-TRACED REFERENCE  (ground truth)",
 			("samples: %d   bounces: %d"):format(ptSamples, S.bounces),
@@ -433,6 +658,7 @@ local function drawHUD()
 			"screen-space passes can only approximate.",
 			"",
 			"TAB  back to the real-time renderer",
+			"N    denoised mode (1 spp, camera-motion stable)",
 			"[ ]  resolution scale        , .  bounces",
 		}
 	else
@@ -440,9 +666,13 @@ local function drawHUD()
 			("view: %s"):format(MODE_NAMES[S.mode] or "?"),
 			("accumulated: %d spp"):format(accFrames),
 			"",
-			("AO  [A] %s   radius %.2f  (%d taps)"):format(S.ao and "ON " or "off", S.aoRadius, S.aoSamples),
-			("GI  [G] %s   %d rays x %d steps, r=%.2f"):format(S.gi and "ON " or "off", S.giRays, S.giSteps, S.giRadius),
-			("SSR [R] %s   %d steps, %.1f units"):format(S.ssr and "ON " or "off", S.ssrSteps, S.ssrDist),
+			("AO  [A] %s   radius %.2f  (%d taps)%s"):format(S.ao and "ON " or "off", S.aoRadius, S.aoSamples,
+				S.rtAO and "   [F3] RAY TRACED" or ""),
+			("GI  [G] %s   %d rays x %d steps, r=%.2f%s"):format(S.gi and "ON " or "off", S.giRays, S.giSteps, S.giRadius,
+				S.rtShadows and "   [F2] RT SHADOWS" or ""),
+			("SSR [R] %s   %d steps, %.1f units%s"):format(S.ssr and "ON " or "off", S.ssrSteps, S.ssrDist,
+				S.rtRefl and "   [F4] RAY TRACED" or ""),
+			shaders.light_hw and "T    toggle all ray-traced passes" or "",
 			"",
 			"0-8  view modes      TAB  path-traced reference",
 			"C    A/B wipe (mouse x)   O  auto orbit",
@@ -465,8 +695,11 @@ local function drawHUD()
 	-- perf readout, bottom right
 	love.graphics.setColor(0.7, 0.75, 0.8, 1)
 	local st = love.graphics.getStats()
-	local perf = ("%d fps   %dx%d (%.0f%%)   vram %.0f MB")
-		:format(love.timer.getFPS(), RW, RH, renderScale * 100, st.texturememory / 1048576)
+	-- getAverageDelta is the mean frame time over the last second: steadier
+	-- than fps for judging a budget, and it is whole-frame wall clock, the
+	-- same thing --bench measures.
+	local perf = ("%.2f ms   %d fps   %dx%d (%.0f%%)   vram %.0f MB")
+		:format(love.timer.getAverageDelta() * 1000, love.timer.getFPS(), RW, RH, renderScale * 100, st.texturememory / 1048576)
 	love.graphics.print(perf, W - font:getWidth(perf) - 14, H - font:getHeight() - 10)
 
 	if S.split and not S.pathTrace then
@@ -483,7 +716,11 @@ local function drawHUD()
 			"0                full composite",
 			"5 6 7 8          albedo | normals | depth | roughness",
 			"A / G / R        toggle AO / GI / SSR",
+			"F2 / F3 / F4     ray traced shadows / AO / reflections",
+			"T                all three ray traced passes at once",
 			"TAB              path-traced reference",
+			"N                denoised path tracing (in TAB view)",
+			"V                denoiser debug views",
 			"C                A/B wipe, follows the mouse",
 			"O                slow auto orbit",
 			"[ / ]            render scale down / up",
@@ -528,6 +765,11 @@ function love.load(args)
 		if a == "--pt"    then S.pathTrace = true end
 		if a == "--nohud" then S.showHelp = false; S.hideHUD = true end
 		if a == "--hw"    then S.pathTrace = true; useHW = true end
+		if a == "--dn"    then S.pathTrace = true; S.denoise = true end
+		if a == "--anim"  then S.animate = true end
+		if a == "--rt"    then S.rtShadows = true; S.rtAO = true; S.rtRefl = true end
+		if a == "--dnview" then S.dnView = tonumber(args[i + 1]) or 0 end
+		if a == "--orbit" then S.autoOrbit = true end
 		if a == "--bench" then benchFrames = tonumber(args[i + 1]) or 300 end
 		if a == "--bounces" then S.bounces = tonumber(args[i + 1]) or 5 end
 		if a == "--tag"   then benchTag = args[i + 1] or "" end
@@ -574,11 +816,25 @@ end
 function love.update(dt)
 	if S.autoOrbit then cam.yaw = cam.yaw + dt * 0.12 end
 
-	-- Any camera or quality change invalidates the running mean.
+	-- Spin the tall block: one TLAS refit per frame, nothing rebuilt. Only
+	-- meaningful in the hardware path traced view -- the SDF and the deferred
+	-- pipeline march a scene function that does not know the block moved.
+	if S.animate and S.pathTrace and useHW and rtScene and rtScene.canAnimate then
+		animTime = animTime + dt
+		rtScene.setBlockAngle(animTime * 0.5)
+	end
+
+	-- Any camera or quality change invalidates the running mean -- except in
+	-- denoised path tracing, where surviving camera motion is the entire
+	-- point: reprojection carries the history, and quality changes still
+	-- reset because they change what the history means.
 	local ck, sk = cameraKey(), settingsKey()
 	if ck ~= camKey or sk ~= setKey then
+		local cameraOnly = (sk == setKey)
 		camKey, setKey = ck, sk
-		resetAccum()
+		if not (S.pathTrace and S.denoise and cameraOnly) then
+			resetAccum()
+		end
 	end
 end
 
@@ -589,7 +845,9 @@ function love.draw()
 	-- roughness rather than coverage.
 	love.graphics.setBlendMode("replace", "premultiplied")
 
-	if S.pathTrace then
+	if S.pathTrace and S.denoise then
+		passDenoise()   -- canvas passes need the replace blend set above
+	elseif S.pathTrace then
 		love.graphics.setBlendMode("alpha")
 		passPathTrace()
 	else
@@ -627,8 +885,18 @@ function love.draw()
 			benchStart = love.timer.getTime()
 		elseif benchStart and benchWarm >= 30 + benchFrames then
 			local elapsed = love.timer.getTime() - benchStart
+			local benchMode
+			if S.pathTrace then
+				benchMode = (useHW and "hardware" or "sdf") .. (S.denoise and "+dn" or "")
+			else
+				benchMode = "deferred"
+					.. (S.rtShadows and "+rtS" or "")
+					.. (S.rtAO and "+rtA" or "")
+					.. (S.rtRefl and "+rtR" or "")
+			end
 			local report = ("%s\t%s\t%d\t%d\t%dx%d\t%.4f\t%.2f\t%.4f\n"):format(
-				benchTag, useHW and "hardware" or "sdf", S.bounces, benchFrames,
+				benchTag, benchMode,
+				S.bounces, benchFrames,
 				RW, RH, elapsed, benchFrames / elapsed, elapsed * 1000.0 / benchFrames)
 			love.filesystem.append("bench.txt", report)
 			love.event.quit()
@@ -642,12 +910,40 @@ function love.keypressed(k)
 	if k == "tab" then
 		S.pathTrace = not S.pathTrace
 		resetAccum()
+	elseif k == "n" then
+		if S.pathTrace then
+			S.denoise = not S.denoise
+			resetAccum()
+		end
+	elseif k == "v" then
+		if S.pathTrace and S.denoise then
+			S.dnView = (S.dnView + 1) % 6
+		end
+	elseif k == "b" then
+		if S.pathTrace and useHW and rtScene and rtScene.canAnimate then
+			S.animate = not S.animate
+			-- Coming to rest somewhere other than the SDF's block angle would
+			-- quietly break every SDF-vs-hardware comparison from then on.
+			if not S.animate then rtScene.setBlockAngle(0) end
+		end
 	elseif k == "h" then
 		-- Only meaningful inside the path traced view; the deferred pipeline
 		-- has no ray query variant.
 		if shaders.pathtrace_hw and rtScene then
 			useHW = not useHW
 			resetAccum()
+		end
+	elseif k == "f2" then
+		if shaders.light_hw then S.rtShadows = not S.rtShadows end
+	elseif k == "f3" then
+		if shaders.rtao then S.rtAO = not S.rtAO end
+	elseif k == "f4" then
+		if shaders.ssr_hw then S.rtRefl = not S.rtRefl end
+	elseif k == "t" then
+		-- one key for the whole hybrid: everything ray-traced, or nothing
+		if shaders.light_hw then
+			local on = not (S.rtShadows and S.rtAO and S.rtRefl)
+			S.rtShadows, S.rtAO, S.rtRefl = on, on, on
 		end
 	elseif k >= "0" and k <= "8" and #k == 1 then
 		S.mode = tonumber(k)

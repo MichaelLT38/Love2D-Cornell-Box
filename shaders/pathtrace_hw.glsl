@@ -20,63 +20,11 @@
 // calling a different scene function -- see rt_scene.lua. Bit 0 means
 // "occludes"; the emitter does not set it.
 
-#pragma rayquery
+// The TLAS, scene buffers, traceHW and occludedHW all live in rq_common.glsl,
+// which main.lua prepends -- they are shared with the ray-traced variants of
+// the deferred passes.
 
 uniform float uBounces;
-
-uniform accelerationStructureEXT uTLAS;
-
-// Vertex data for the scene instance. Indexed by primitive, three per triangle.
-// The emitter instance needs none of this: it is one flat quad whose normal and
-// material are known constants, so it is handled by custom index alone.
-// readonly because love requires it of storage buffers in vertex and pixel
-// shaders unless writes are explicitly enabled -- and nothing here writes.
-readonly buffer Verts { vec4 vpos[]; };
-readonly buffer Norms { vec4 vnrm[]; };
-readonly buffer Mats  { float vmat[]; };
-
-bool traceHW(vec3 ro, vec3 rd, float tmax, out float t, out vec3 n, out float id) {
-	rayQueryEXT rq;
-	rayQueryInitializeEXT(rq, uTLAS, gl_RayFlagsOpaqueEXT, 0xFF, ro, 0.0005, rd, tmax);
-	while (rayQueryProceedEXT(rq)) {}
-
-	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
-		return false;
-
-	t = rayQueryGetIntersectionTEXT(rq, true);
-
-	if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) == 1) {
-		n  = LIGHT_N;
-		id = M_LIGHT;
-		return true;
-	}
-
-	int  p  = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-	vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-
-	// Barycentrics are (b1, b2); the first vertex carries 1 - b1 - b2. Smooth
-	// normals matter for exactly one object -- the sphere is tessellated here
-	// and analytic in the SDF, and flat shading it would show up as facets in
-	// the one surface in the scene that reflects everything else.
-	vec3 n0 = vnrm[p * 3 + 0].xyz;
-	vec3 n1 = vnrm[p * 3 + 1].xyz;
-	vec3 n2 = vnrm[p * 3 + 2].xyz;
-	n  = normalize(n0 * (1.0 - bc.x - bc.y) + n1 * bc.x + n2 * bc.y);
-	id = vmat[p];
-	return true;
-}
-
-bool occludedHW(vec3 ro, vec3 rd, float dist) {
-	rayQueryEXT rq;
-	// Cull mask 0x01: scene only. TerminateOnFirstHit because a shadow ray asks
-	// "is anything in the way", not "what is nearest" -- which is the same
-	// reason the marched version returns the moment h < 0.0005.
-	rayQueryInitializeEXT(rq, uTLAS,
-		gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-		0x01, ro, 0.0005, rd, dist);
-	while (rayQueryProceedEXT(rq)) {}
-	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
-}
 
 vec3 sampleEmitterNEE(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, float metal, inout uint seed) {
 	vec2 ul = rnd2(seed) * 2.0 - 1.0;
@@ -105,12 +53,18 @@ vec3 sampleEmitterNEE(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, float me
 	return (diff + spec) * LIGHT_E * (NoL * lnl * LIGHT_AREA / max(d2, 1e-4));
 }
 
-vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
-	uint seed = seedPixel(love_PixelCoord.xy, uFrame);
-
-	vec2 uv = (love_PixelCoord.xy + rnd2(seed)) / uRes;
+// Same driver-snippet arrangement as pathtrace.glsl: main.lua appends either
+// the accumulating reference entry point or the denoiser's MRT one. First-hit
+// guide data is captured without any extra rnd() calls, so the sample
+// sequence -- and therefore the reference images -- are unchanged.
+vec3 pathtracePixel(vec2 uv, inout uint seed,
+                    out vec3 gN, out float gZ, out vec3 gAlb, out float gId,
+                    out float gReflT) {
 	vec3 ro = uCamPos;
 	vec3 rd = rayDir(uv);
+
+	gN = -rd; gZ = 1e6; gAlb = vec3(1.0); gId = -1.0; gReflT = 0.0;
+	bool firstPure = false;
 
 	vec3 radiance   = vec3(0.0);
 	vec3 throughput = vec3(1.0);
@@ -123,6 +77,8 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 		float t, id; vec3 N;
 		if (!traceHW(ro, rd, 40.0, t, N, id)) break;   // escaped through the open face
 
+		if (b == 1 && firstPure) gReflT = t;
+
 		vec3 P = ro + rd * t;
 		if (dot(N, -rd) < 0.0) N = -N;
 		vec3 V = -rd;
@@ -130,12 +86,20 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 		vec3 albedo, emis; float rough, metal;
 		getMaterial(id, albedo, rough, metal, emis);
 
+		if (b == 0) {
+			gN = N;
+			gZ = dot(P - uCamPos, uCamFwd);
+			gAlb = (id > 4.5) ? vec3(1.0) : albedo;   // emission stays undivided
+			gId = id;
+		}
+
 		if (id > 4.5) {
 			if (specularPath) radiance += throughput * emis;
 			break;
 		}
 
 		bool pureSpec = (metal > 0.5 && rough < 0.12);
+		if (b == 0) firstPure = pureSpec;
 
 		if (!pureSpec) {
 			radiance += throughput * sampleEmitterNEE(P, N, V, albedo, rough, metal, seed);
@@ -179,6 +143,5 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 		}
 	}
 
-	radiance = min(radiance, vec3(60.0));
-	return vec4(radiance, 1.0);
+	return min(radiance, vec3(60.0));
 }
