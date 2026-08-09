@@ -1,5 +1,7 @@
 # Cornell Box — SSAO / GI / SSR in LÖVE 2D
 
+![Cornell Box render](images/cornell-box.png)
+
 Can LÖVE 2D do ambient occlusion, global illumination and screen-space reflections?
 **Yes — all three, in real time.** This is the demo that proves it.
 
