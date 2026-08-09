@@ -1,6 +1,6 @@
 function love.conf(t)
 	t.identity                = "cornellbox-gi"
-	t.version                 = "11.5"
+	t.version                 = "12.0"
 	t.console                 = false
 
 	t.window.title            = "Cornell Box - SSAO / SSGI / SSR in LOVE2D"
@@ -11,9 +11,9 @@ function love.conf(t)
 	t.window.minheight        = 360
 	t.window.vsync            = 0
 	t.window.msaa             = 0
-	t.window.depth            = 0
+	t.window.depth            = false
 	t.window.stencil          = false
-	t.window.highdpi          = false
+	t.highdpi                 = false
 
 	t.modules.joystick        = false
 	t.modules.physics         = false

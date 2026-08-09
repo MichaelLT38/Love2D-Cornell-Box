@@ -73,8 +73,21 @@ local frame     = 0     -- monotonic, only feeds the RNG
 local accFrames = 0     -- samples merged into the accumulation buffers
 local ptSamples = 0
 
+-- Hardware ray tracing. `rtScene` holds the acceleration structures and the
+-- buffers the shader reads; nil means this build or this GPU cannot do it, and
+-- `rtStatus` says which. Everything about it is optional -- the SDF path tracer
+-- is the reference and stays the default.
+local rtScene, rtStatus = nil, "not attempted"
+local useHW = false
+
 -- screenshot automation (love . --shot [frames])
 local shotAt, shotDone = nil, false
+
+-- bench automation (love . --bench [frames]). Measures the CURRENT mode and
+-- quits, so the two path tracers are compared by running the app twice rather
+-- than by switching mid-run -- no shader-swap or cache effects in the numbers.
+local benchFrames, benchStart, benchWarm = nil, nil, 0
+local benchTag = ""
 
 -- ======================================================================
 --  helpers
@@ -178,6 +191,24 @@ local function loadShaders()
 	shaders.composite = build("composite")
 	shaders.pathtrace = build("pathtrace")
 	shaders.ptresolve = build("ptresolve")
+
+	-- Hardware ray query variant. GLSL 4 rather than 3 because rayQueryEXT
+	-- needs #version 460, and `#pragma rayquery` is what makes love emit the
+	-- version and the extension line. Optional in every sense: a build or a GPU
+	-- without ray queries just does not get this shader, and the SDF path
+	-- tracer above remains the reference.
+	if rtScene and love.graphics.getSupported().rayquery then
+		local body = love.filesystem.read("shaders/pathtrace_hw.glsl")
+		if body then
+			local src = "#pragma language glsl4\n" .. common .. "\n" .. body
+			local ok, res = pcall(love.graphics.newShader, src)
+			if ok then
+				shaders.pathtrace_hw = res
+			else
+				rtStatus = "hw shader failed: " .. tostring(res)
+			end
+		end
+	end
 end
 
 local function newCanvas(w, h, fmt, filter)
@@ -346,12 +377,19 @@ local function passComposite(cur)
 end
 
 local function passPathTrace()
-	local sh = shaders.pathtrace
+	local hw = useHW and shaders.pathtrace_hw and rtScene
+	local sh = hw and shaders.pathtrace_hw or shaders.pathtrace
 	love.graphics.setCanvas(cv.pt)
 	love.graphics.setBlendMode("add", "premultiplied")
 	love.graphics.setShader(sh)
 	sendCamera(sh, RW, RH)
 	send(sh, "uBounces", S.bounces)
+	if hw then
+		send(sh, "uTLAS", rtScene.tlas)
+		send(sh, "Verts", rtScene.pos)
+		send(sh, "Norms", rtScene.nrm)
+		send(sh, "Mats",  rtScene.mat)
+	end
 	fullscreen(RW, RH)
 	love.graphics.setShader()
 	love.graphics.setBlendMode("alpha")
@@ -489,6 +527,10 @@ function love.load(args)
 		if a == "--mode"  then S.mode = tonumber(args[i + 1]) or 0 end
 		if a == "--pt"    then S.pathTrace = true end
 		if a == "--nohud" then S.showHelp = false; S.hideHUD = true end
+		if a == "--hw"    then S.pathTrace = true; useHW = true end
+		if a == "--bench" then benchFrames = tonumber(args[i + 1]) or 300 end
+		if a == "--bounces" then S.bounces = tonumber(args[i + 1]) or 5 end
+		if a == "--tag"   then benchTag = args[i + 1] or "" end
 	end
 
 	love.graphics.setDefaultFilter("linear", "linear")
@@ -499,8 +541,26 @@ function love.load(args)
 	quad = love.graphics.newImage(id)
 
 	W, H = love.graphics.getDimensions()
+
+	-- Before loadShaders: the hardware shader is only built when there is
+	-- something for it to trace.
+	rtScene, rtStatus = require("rt_scene").build()
+	if rtScene then
+		rtStatus = ("%d triangles, %.1f KB of structures")
+			:format(rtScene.tris, rtScene.bytes / 1024)
+	else
+		useHW = false
+	end
+
 	loadShaders()
+	if useHW and not shaders.pathtrace_hw then useHW = false end
 	buildCanvases()
+
+	-- LOVE is a GUI subsystem app on Windows, so stdout is not available; the
+	-- save directory is where anything diagnostic has to go.
+	pcall(love.filesystem.write, "rt_status.txt", ("rayquery supported: %s\nstructures: %s\nhw shader: %s\nuseHW: %s\n")
+		:format(tostring(love.graphics.getSupported().rayquery), tostring(rtStatus),
+			shaders.pathtrace_hw and "compiled" or "absent", tostring(useHW)))
 
 	camKey = cameraKey()
 	setKey = settingsKey()
@@ -557,6 +617,23 @@ function love.draw()
 	elseif shotDone then
 		love.event.quit()
 	end
+
+	if benchFrames then
+		-- 30 frames of warmup discarded: shader compilation, canvas allocation
+		-- and the acceleration structure build all land in the first few, and
+		-- none of them are what is being measured.
+		benchWarm = benchWarm + 1
+		if benchWarm == 30 then
+			benchStart = love.timer.getTime()
+		elseif benchStart and benchWarm >= 30 + benchFrames then
+			local elapsed = love.timer.getTime() - benchStart
+			local report = ("%s\t%s\t%d\t%d\t%dx%d\t%.4f\t%.2f\t%.4f\n"):format(
+				benchTag, useHW and "hardware" or "sdf", S.bounces, benchFrames,
+				RW, RH, elapsed, benchFrames / elapsed, elapsed * 1000.0 / benchFrames)
+			love.filesystem.append("bench.txt", report)
+			love.event.quit()
+		end
+	end
 end
 
 function love.keypressed(k)
@@ -565,6 +642,13 @@ function love.keypressed(k)
 	if k == "tab" then
 		S.pathTrace = not S.pathTrace
 		resetAccum()
+	elseif k == "h" then
+		-- Only meaningful inside the path traced view; the deferred pipeline
+		-- has no ray query variant.
+		if shaders.pathtrace_hw and rtScene then
+			useHW = not useHW
+			resetAccum()
+		end
 	elseif k >= "0" and k <= "8" and #k == 1 then
 		S.mode = tonumber(k)
 	elseif k == "a" then S.ao  = not S.ao
