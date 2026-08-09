@@ -1,0 +1,11 @@
+# LÖVE temporary/runtime files
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Build/output artifacts
+build/
+dist/
