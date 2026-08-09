@@ -12,10 +12,23 @@ uniform float uSplit;     // < 0 disables; otherwise screen-x of the wipe
 uniform float uAOEnable;
 uniform float uSSREnable;
 
+// Denoised deferred mode: the diffuse terms (direct + GI) arrive as one
+// FILTERED irradiance texture and get the albedo multiplied back here.
+uniform Image texDnDiff;
+uniform Image texDnSSR;
+uniform float uDnDeferred;
+
 vec3 shade(vec2 uv, bool full) {
+	if (uDnDeferred > 0.5) {
+		if (!full) return Texel(accDirect, uv).rgb;   // wipe compares raw direct
+		vec4 ab  = Texel(gAlb, uv);
+		vec3 alb = (ab.w > 4.5) ? vec3(1.0) : ab.rgb;
+		vec3 ssr = (uSSREnable > 0.5) ? Texel(texDnSSR, uv).rgb : vec3(0.0);
+		return Texel(texDnDiff, uv).rgb * alb + ssr;
+	}
+	vec3 ssr = (full && uSSREnable > 0.5) ? Texel(accSSR, uv).rgb : vec3(0.0);
 	vec3 direct = Texel(accDirect, uv).rgb;
 	vec3 gi     = Texel(accGI,     uv).rgb;
-	vec3 ssr    = (full && uSSREnable > 0.5) ? Texel(accSSR, uv).rgb : vec3(0.0);
 	if (!full) return direct;
 	return direct + gi + ssr;
 }

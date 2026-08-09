@@ -98,6 +98,23 @@ Denoised bench unchanged: 10.95 ms at 1440p (`bench-phase5.txt`).
 Deferred by design: batched builds and a Mesh convenience constructor — both
 were conditioned on real usage that still does not exist.
 
+## Phase 6 facts (denoised hybrid deferred pipeline)
+
+The deferred pipeline's ray-traced signals now ride the SVGF machinery
+(`--rtdn` / `N` in the deferred view): merged demodulated diffuse through
+reprojection + 4 a-trous iterations, AO through a temporal-only leg,
+reflections through their own 3-iteration chain reprojected by virtual depth
+(hit distance in ssr_hw's alpha). The SSGI gather reads remodulated denoiser
+history and runs at half rays in denoised mode. `bench-phase6-dnd.txt`:
+3.72 ms @720p / 9.35 ms @1080p / 19.22 ms @1440p (the un-denoised pipeline is
+already 15.6 ms at 1440p — the chain itself costs ~3.6 ms). fp16 conversion
+also cut the PT denoiser from 10.95 to 7.99 ms at 1440p.
+
+Compare `shot-deferred-rt-orbit-before.png` (raw noise mid-orbit) against
+`shot-deferred-rtdn-orbit.png`. Regression: SS deferred bit-identical, RT
+deferred (denoise off) max 1/255, PT reference max 2/255 — all modes
+untouched with the feature off. Denoised static vs accumulated: 1.13% MAD.
+
 ## Headline numbers (base0, 8 bounces)
 
 | render size | SDF | hardware | ratio |

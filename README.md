@@ -36,6 +36,7 @@ Requires LÖVE 11.x. Built and verified against 11.5 on Windows.
 | `A` `G` `R` | toggle AO / GI / SSR |
 | `F2` `F3` `F4` | ray-traced shadows / AO / reflections (needs the rayquery build) |
 | `T` | all three ray-traced passes at once |
+| `N` | in the deferred view: denoise the hybrid (motion-stable); in the path traced view: SVGF mode |
 | `TAB` | path-traced reference |
 | `N` | denoised path tracing — 1 spp + SVGF-lite, stable under camera motion |
 | `V` | denoiser debug views (raw 1 spp / variance / history / albedo / normals) |
@@ -148,6 +149,26 @@ trace helpers). **The price of the whole swap is approximately nothing**:
 2.61 ms ray-traced vs 2.54 ms screen-space at 1280×720, and at 2560×1440 the
 ray-traced pipeline is marginally *faster* (15.59 vs 15.84 ms) — one ray query
 outruns a 40-step depth-buffer march with binary refinement.
+
+### And it stays clean in motion
+
+`N` in the deferred view (or `--rtdn`) adds the denoiser to the hybrid: the
+stochastic ray-traced signals ride the same machinery the path traced mode
+uses. The merged diffuse light (demodulated by albedo) gets temporal
+reprojection plus a four-iteration à-trous filter, AO gets a temporal-only
+leg, and reflections get their own short chain reprojected by **virtual
+depth** — the hit distance [ssr_hw.glsl](shaders/ssr_hw.glsl) reports in its
+alpha channel. The SSGI gather reads the remodulated, motion-surviving
+history instead of the reset-prone accumulation, so bounce light no longer
+collapses when the camera moves — and because the filter chain eats variance,
+denoised mode runs the gather at half the rays.
+
+Compare `baselines/shot-deferred-rt-orbit-before.png` (raw stochastic noise
+mid-orbit) with `shot-deferred-rtdn-orbit.png` (clean). Cost: **3.7 ms at
+1280×720 (269 fps), 9.3 ms at 1920×1080 (107 fps), 19.2 ms at 2560×1440
+(52 fps)** — at 1440p the un-denoised pipeline already sits at 15.6 ms, so
+the whole denoiser adds ~3.6 ms and 1080p is the sweet spot. Every filter
+target that carries color is rgba16f; guides and moments stay fp32.
 
 ## What the comparison actually shows
 

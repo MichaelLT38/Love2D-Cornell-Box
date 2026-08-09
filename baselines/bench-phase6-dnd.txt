@@ -1,0 +1,8 @@
+dnd6-fp32	deferred+rtS+rtA+rtR	5	300	1280x720	1.4608	205.37	4.8693
+dnd6-fp32	deferred+rtS+rtA+rtR	5	300	2560x1440	8.0989	37.04	26.9962
+dnd6-fp16	deferred+rtS+rtA+rtR	5	300	1280x720	1.3274	226.01	4.4246
+dnd6-fp16	deferred+rtS+rtA+rtR	5	300	2560x1440	7.0789	42.38	23.5964
+dnd6-ptdn	hardware+dn	5	300	2560x1440	2.3961	125.21	7.9869
+dnd6-final	deferred+rtS+rtA+rtR	5	300	2560x1440	5.7674	52.02	19.2246
+dnd6-final	deferred+rtS+rtA+rtR	5	300	1920x1080	2.8049	106.95	9.3497
+dnd6-final	deferred+rtS+rtA+rtR	5	300	1280x720	1.1160	268.81	3.7201

@@ -8,6 +8,9 @@
 //   * geometry that left the frame still reflects, because the TLAS does not
 //     care what the camera sees
 //
+// Alpha carries the reflection HIT DISTANCE for the denoiser's
+// virtual-depth reprojection (0 where there is no reflection).
+//
 // The hit is shaded with the same next-event estimation as everywhere else,
 // plus the previous accumulated frame's bounce light when the hit point
 // happens to be on screen (the same trick SSR uses for its whole result --
@@ -48,16 +51,16 @@ vec3 directAtHit(vec3 P, vec3 N, vec3 albedo, float metal, inout uint seed) {
 }
 
 vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
-	if (uSSREnable < 0.5) return vec4(0.0, 0.0, 0.0, 1.0);
+	if (uSSREnable < 0.5) return vec4(0.0);
 
 	vec2 uv = pixUV();
 	vec4 g  = Texel(gPos, uv);
-	if (g.w > 1e5) return vec4(0.0, 0.0, 0.0, 1.0);
+	if (g.w > 1e5) return vec4(0.0);
 
 	vec4  nr = Texel(gNrm, uv);
 	vec4  ab = Texel(gAlb, uv);
 	float id = ab.w;
-	if (id > 4.5) return vec4(0.0, 0.0, 0.0, 1.0);   // emitter
+	if (id > 4.5) return vec4(0.0);   // emitter
 
 	vec3  P = g.xyz;
 	vec3  N = normalize(nr.xyz);
@@ -71,7 +74,7 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 	// Same fade as ssr.glsl: a single ray is still a bad estimator for a very
 	// wide lobe, hardware or not, and the diffuse GI term carries that energy.
 	float roughFade = 1.0 - smoothstep(0.35, 0.80, rough);
-	if (roughFade <= 0.002) return vec4(0.0, 0.0, 0.0, 1.0);
+	if (roughFade <= 0.002) return vec4(0.0);
 
 	vec3 f0 = mix(vec3(0.04), ab.rgb, metal);
 
@@ -81,7 +84,7 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 	vec3 H = sampleGGX(N, rough, uh.x, uh.y);
 	vec3 R = reflect(-V, H);
 	float NoL = dot(N, R);
-	if (NoL <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
+	if (NoL <= 0.0) return vec4(0.0);
 
 	float VoH = max(dot(V, H), 1e-4);
 	float NoH = max(dot(N, H), 1e-4);
@@ -92,10 +95,10 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 	// --- one real ray ----------------------------------------------------
 	float t; vec3 hN; float hId;
 	if (!traceHW(P + N * 0.004, R, 40.0, t, hN, hId))
-		return vec4(0.0, 0.0, 0.0, 1.0);   // out through the open face
+		return vec4(0.0);   // out through the open face
 
 	if (hId > 4.5)                          // the mirror sees the light itself
-		return vec4(LIGHT_E * weight * roughFade, 1.0);
+		return vec4(LIGHT_E * weight * roughFade, t);
 
 	vec3 HP = P + N * 0.004 + R * t;
 	if (dot(hN, -R) < 0.0) hN = -hN;
@@ -115,5 +118,5 @@ vec4 effect(vec4 vcol, Image tex, vec2 tc, vec2 sc) {
 			col += Texel(texPrevGI, pr.xy).rgb;
 	}
 
-	return vec4(col * weight * roughFade, 1.0);
+	return vec4(col * weight * roughFade, t);
 }

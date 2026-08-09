@@ -53,6 +53,9 @@ local S = {
 	rtShadows = false,
 	rtAO      = false,
 	rtRefl    = false,
+	-- Deferred pipeline: SVGF-style denoise of the ray-traced signals, so
+	-- the hybrid stays clean while the camera moves.
+	dnDeferred = false,
 }
 local animTime = 0
 
@@ -155,7 +158,9 @@ local function fullscreen(w, h)
 	love.graphics.draw(quad, 0, 0, 0, w, h)
 end
 
-local function resetAccum()
+-- The running-mean accumulation buffers. Cleared whenever they can no longer
+-- be trusted -- which includes any camera motion, since they do not reproject.
+local function resetAccumBuffers()
 	accFrames = 0
 	ptSamples = 0
 	if cv.pt then
@@ -170,13 +175,22 @@ local function resetAccum()
 			love.graphics.setCanvas()
 		end
 	end
-	-- Zeroed history data means histLen 0, which the reprojection pass treats
-	-- as "no history"; zeroed nrmZ fails its depth test. No reset flag needed.
+end
+
+-- The denoiser's reprojected history (shared between the path traced and
+-- deferred denoisers -- they never run in the same frame). Zeroed history
+-- data means histLen 0, which the reprojection passes treat as "no history";
+-- zeroed nrmZ fails their depth test. No reset flag needed.
+local function resetDnHistory()
 	if cv.dn then
 		for i = 1, 2 do
 			love.graphics.setCanvas(cv.dn.histData[i])
 			love.graphics.clear(0, 0, 0, 0)
 			love.graphics.setCanvas(cv.dn.nrmZ[i])
+			love.graphics.clear(0, 0, 0, 0)
+			love.graphics.setCanvas(cv.dn.aoHist[i])
+			love.graphics.clear(1, 0, 0, 1)   -- ao = 1, no history
+			love.graphics.setCanvas(cv.dn.reflData[i])
 			love.graphics.clear(0, 0, 0, 0)
 			love.graphics.setCanvas()
 		end
@@ -184,10 +198,16 @@ local function resetAccum()
 	end
 end
 
+local function resetAccum()
+	resetAccumBuffers()
+	resetDnHistory()
+end
+
 local function settingsKey()
 	return table.concat({
 		tostring(S.ao), tostring(S.gi), tostring(S.ssr),
 		tostring(S.rtShadows), tostring(S.rtAO), tostring(S.rtRefl),
+		tostring(S.dnDeferred),
 		S.aoRadius, S.aoPower, S.aoSamples,
 		S.giRays, S.giSteps, S.giRadius, S.giStrength,
 		S.ssrSteps, S.ssrDist, S.ssrThick, S.bounces,
@@ -258,6 +278,11 @@ local function loadShaders()
 	shaders.variance     = build("variance")
 	shaders.atrous       = build("atrous")
 	shaders.dnresolve    = build("dnresolve")
+	shaders.guidepack    = build("guidepack")
+	shaders.reproject_def = build("reproject_def")
+	shaders.ao_temporal  = build("ao_temporal")
+	shaders.reproject_refl = build("reproject_refl")
+	shaders.remodhist    = build("remodhist")
 
 	-- Hardware ray query variant. GLSL 4 rather than 3 because rayQueryEXT
 	-- needs #version 460, and `#pragma rayquery` is what makes love emit the
@@ -323,21 +348,44 @@ local function buildCanvases()
 	-- Denoiser targets, all rgba32f (MRT batches must share a format). Data
 	-- canvases sample nearest; the two history pairs sample linear because
 	-- the reprojected lookup lands between pixels.
+	-- Color-carrying targets are rgba16f (radiance tops out around 60, well
+	-- inside half-float range, and the filter chain is bandwidth-bound);
+	-- guides and moments stay rgba32f -- depth validity and variance both
+	-- suffer visibly in half precision.
 	cv.dn = {
-		color = newCanvas(RW, RH, "rgba32f", "nearest"),   -- raw 1 spp, demodulated
-		alb   = newCanvas(RW, RH, "rgba32f", "nearest"),   -- albedo + material id
+		color = newCanvas(RW, RH, "rgba16f", "nearest"),   -- raw 1 spp, demodulated
+		alb   = newCanvas(RW, RH, "rgba16f", "nearest"),   -- albedo + material id
 		nrmZ  = { newCanvas(RW, RH, "rgba32f", "nearest"),
 		          newCanvas(RW, RH, "rgba32f", "nearest") },
-		acc   = newCanvas(RW, RH, "rgba32f", "nearest"),   -- reprojected color
-		var   = newCanvas(RW, RH, "rgba32f", "nearest"),   -- color + variance
-		histColor = { newCanvas(RW, RH, "rgba32f", "linear"),
-		              newCanvas(RW, RH, "rgba32f", "linear") },
+		acc   = newCanvas(RW, RH, "rgba16f", "nearest"),   -- reprojected color
+		var   = newCanvas(RW, RH, "rgba16f", "nearest"),   -- color + variance
+		histColor = { newCanvas(RW, RH, "rgba16f", "linear"),
+		              newCanvas(RW, RH, "rgba16f", "linear") },
 		histData  = { newCanvas(RW, RH, "rgba32f", "linear"),
 		              newCanvas(RW, RH, "rgba32f", "linear") },
-		at    = { newCanvas(RW, RH, "rgba32f", "nearest"),
-		          newCanvas(RW, RH, "rgba32f", "nearest") },
+		at    = { newCanvas(RW, RH, "rgba16f", "nearest"),
+		          newCanvas(RW, RH, "rgba16f", "nearest") },
+		-- deferred AO temporal history: r = ao, g = history length / 64
+		aoHist = { newCanvas(RW, RH, "rgba8", "linear"),
+		           newCanvas(RW, RH, "rgba8", "linear") },
+		-- deferred reflection chain: its own history pair (the diffuse chain
+		-- owns histColor/histData) plus one scratch so its last iteration
+		-- cannot clobber the diffuse chain's final output in at[2]
+		reflHist = { newCanvas(RW, RH, "rgba16f", "linear"),
+		             newCanvas(RW, RH, "rgba16f", "linear") },
+		reflData = { newCanvas(RW, RH, "rgba32f", "linear"),
+		             newCanvas(RW, RH, "rgba32f", "linear") },
+		rat = newCanvas(RW, RH, "rgba16f", "nearest"),
+		-- remodulated history the SSGI gather reads in denoised mode
+		remod = newCanvas(RW, RH, "rgba16f", "linear"),
 		idx = 1,
 	}
+
+	-- a black texture, for feeding "nothing" to a pass that wants a texture
+	cv.black = newCanvas(4, 4, "rgba16f", "nearest")
+	love.graphics.setCanvas(cv.black)
+	love.graphics.clear(0, 0, 0, 1)
+	love.graphics.setCanvas()
 
 	resetAccum()
 end
@@ -409,10 +457,16 @@ local function passLight(prev)
 	send(sh, "gPos", cv.gPos)
 	send(sh, "gNrm", cv.gNrm)
 	send(sh, "gAlb", cv.gAlb)
-	send(sh, "texAO", cv.aoA)
-	send(sh, "texPrevDirect", prev[1])
-	send(sh, "texPrevGI",     prev[2])
-	send(sh, "uGIRays",     S.giRays)
+	-- in denoised mode AO arrives temporally stabilized and the GI gather
+	-- reads the remodulated denoiser history, which survives camera motion
+	local dn = S.dnDeferred and shaders.ao_temporal
+	send(sh, "texAO", dn and cv.dn.aoHist[cv.dn.idx] or cv.aoA)
+	send(sh, "texPrevDirect", dn and cv.dn.remod or prev[1])
+	send(sh, "texPrevGI",     dn and cv.black or prev[2])
+	-- Half the gather rays in denoised mode: the gather now reads filtered,
+	-- motion-stable history, and the filter chain eats the extra variance --
+	-- the denoiser standing in for brute force, which is its whole job.
+	send(sh, "uGIRays",     dn and math.max(2, math.floor(S.giRays / 2)) or S.giRays)
 	send(sh, "uGISteps",    S.giSteps)
 	send(sh, "uGIRadius",   S.giRadius)
 	send(sh, "uGIStrength", S.giStrength)
@@ -464,17 +518,20 @@ local function passAccum(prev, cur)
 	love.graphics.setCanvas()
 end
 
-local function passComposite(cur)
+local function passComposite(cur, dnTex, dnSSR)
 	local sh = shaders.composite
 	love.graphics.setShader(sh)
 	sendCamera(sh, W, H)
 	send(sh, "gPos", cv.gPos)
 	send(sh, "gNrm", cv.gNrm)
 	send(sh, "gAlb", cv.gAlb)
-	send(sh, "texAO", cv.aoA)
+	send(sh, "texAO", (S.dnDeferred and shaders.ao_temporal) and cv.dn.aoHist[cv.dn.idx] or cv.aoA)
 	send(sh, "accDirect", cur[1])
 	send(sh, "accGI",     cur[2])
 	send(sh, "accSSR",    cur[3])
+	send(sh, "uDnDeferred", dnTex and 1 or 0)
+	send(sh, "texDnDiff", dnTex or cur[1])
+	send(sh, "texDnSSR",  dnSSR or cur[3])
 	send(sh, "uExposure",  S.exposure)
 	send(sh, "uMode",      S.mode)
 	send(sh, "uAOEnable",  S.ao  and 1 or 0)
@@ -616,6 +673,175 @@ local function passDenoise()
 	d.idx = prv
 end
 
+local function sendPrevCam(sh)
+	local pc = prevCam or { camVectors() }
+	send(sh, "uPrevCamPos",   pc[1])
+	send(sh, "uPrevCamRight", pc[2])
+	send(sh, "uPrevCamUp",    pc[3])
+	send(sh, "uPrevCamFwd",   pc[4])
+	send(sh, "uPrevTanHalf",  pc[5] or math.tan(math.rad(cam.fov) * 0.5))
+	send(sh, "uPrevAspect",   pc[6] or RW / RH)
+end
+
+-- Deferred denoise, guide packing. Runs right after the G-buffer because the
+-- AO temporal pass consumes guides BEFORE the main chain runs.
+local function passGuidePack()
+	local d = cv.dn
+	local sh = shaders.guidepack
+	love.graphics.setCanvas(d.nrmZ[d.idx])
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "gPos", cv.gPos)
+	send(sh, "gNrm", cv.gNrm)
+	fullscreen(RW, RH)
+	love.graphics.setShader()
+	love.graphics.setCanvas()
+end
+
+-- Deferred denoise, gather-feed: last frame's diffuse history back into
+-- radiance for the SSGI gather. Runs early, before the light pass consumes it.
+local function passRemodHist()
+	local d = cv.dn
+	local sh = shaders.remodhist
+	love.graphics.setCanvas(d.remod)
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texHist", d.histColor[3 - d.idx])
+	send(sh, "gAlb", cv.gAlb)
+	fullscreen(RW, RH)
+	love.graphics.setShader()
+	love.graphics.setCanvas()
+end
+
+-- Deferred denoise, AO leg: reproject the blurred AO through last frame's
+-- camera. Its output doubles as history, and is what the light pass and
+-- composite read as AO in denoised mode.
+local function passAOTemporal()
+	local d = cv.dn
+	local cur, prv = d.idx, 3 - d.idx
+	local sh = shaders.ao_temporal
+	love.graphics.setCanvas(d.aoHist[cur])
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texCurAO",    cv.aoA)
+	send(sh, "texNrmZ",     d.nrmZ[cur])
+	send(sh, "texPrevNrmZ", d.nrmZ[prv])
+	send(sh, "texAOHist",   d.aoHist[prv])
+	sendPrevCam(sh)
+	fullscreen(RW, RH)
+	love.graphics.setShader()
+	love.graphics.setCanvas()
+end
+
+-- The deferred denoiser: pack guides, temporally reproject the merged
+-- diffuse signal (demodulated direct + GI), and hand the result to the
+-- composite. Shares the cv.dn canvases with the path traced denoiser --
+-- the two never run in the same frame, and every mode switch resets the
+-- history. Returns the texture the composite should use as its diffuse.
+local function passDeferredDenoise()
+	local d = cv.dn
+	local cur, prv = d.idx, 3 - d.idx
+
+	-- guides were packed by passGuidePack right after the G-buffer
+
+	-- temporal reprojection of this frame's (pre-accumulation) lit signal
+	local sh = shaders.reproject_def
+	love.graphics.setCanvas(d.acc, d.histData[cur])
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texCurDirect", cv.litD)
+	send(sh, "texCurGI",     cv.litG)
+	send(sh, "gAlb",         cv.gAlb)
+	send(sh, "texNrmZ",      d.nrmZ[cur])
+	send(sh, "texPrevNrmZ",  d.nrmZ[prv])
+	send(sh, "texHistColor", d.histColor[prv])
+	send(sh, "texHistData",  d.histData[prv])
+	sendPrevCam(sh)
+	send(sh, "uMaxHist", 64)
+	fullscreen(RW, RH)
+
+	-- noise estimate rides into alpha (the shared variance shader, unchanged)
+	sh = shaders.variance
+	love.graphics.setCanvas(d.var)
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texColor",    d.acc)
+	send(sh, "texHistData", d.histData[cur])
+	send(sh, "texNrmZ",     d.nrmZ[cur])
+	fullscreen(RW, RH)
+
+	-- the shared a-trous chain; the first iteration is next frame's history.
+	-- Four iterations rather than the PT chain's five: the deferred history
+	-- is deeper (64 frames surviving motion), so the widest ring buys little.
+	local src = d.var
+	sh = shaders.atrous
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texNrmZ", d.nrmZ[cur])
+	send(sh, "uSigmaL", 4.0)
+	for i, st in ipairs({ 1, 2, 4, 8 }) do
+		local dst = (i == 1) and d.histColor[cur] or d.at[i % 2 + 1]
+		love.graphics.setCanvas(dst)
+		send(sh, "texColor", src)
+		send(sh, "uStep", st)
+		fullscreen(RW, RH)
+		src = dst
+	end
+
+	local diffuseTex = src
+
+	-- reflection chain: virtual-depth reprojection, then a short filter --
+	-- reflections tolerate less blur, and their noise is milder after the
+	-- temporal pass. d.acc and d.var are free again by now and get reused.
+	sh = shaders.reproject_refl
+	love.graphics.setCanvas(d.acc, d.reflData[cur])
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texCurSSR",    cv.ssr)
+	send(sh, "gAlb",         cv.gAlb)
+	send(sh, "texNrmZ",      d.nrmZ[cur])
+	send(sh, "texPrevNrmZ",  d.nrmZ[prv])
+	send(sh, "texHistColor", d.reflHist[prv])
+	send(sh, "texHistData",  d.reflData[prv])
+	sendPrevCam(sh)
+	send(sh, "uMaxHist", 32)
+	fullscreen(RW, RH)
+
+	sh = shaders.variance
+	love.graphics.setCanvas(d.var)
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texColor",    d.acc)
+	send(sh, "texHistData", d.reflData[cur])
+	send(sh, "texNrmZ",     d.nrmZ[cur])
+	fullscreen(RW, RH)
+
+	src = d.var
+	sh = shaders.atrous
+	love.graphics.setShader(sh)
+	sendCamera(sh, RW, RH)
+	send(sh, "texNrmZ", d.nrmZ[cur])
+	send(sh, "uSigmaL", 4.0)
+	-- at[2] is free again (the four-iteration diffuse chain ended in at[1],
+	-- which diffuseTex still points at)
+	for i, st in ipairs({ 1, 2, 4 }) do
+		local dst = (i == 1) and d.reflHist[cur] or ((i == 2) and d.at[2] or d.rat)
+		love.graphics.setCanvas(dst)
+		send(sh, "texColor", src)
+		send(sh, "uStep", st)
+		fullscreen(RW, RH)
+		src = dst
+	end
+
+	love.graphics.setCanvas()
+
+	local p, r, u, f = camVectors()
+	prevCam = { p, r, u, f, math.tan(math.rad(cam.fov) * 0.5), RW / RH }
+	d.idx = prv
+
+	return diffuseTex, src
+end
+
 -- ======================================================================
 --  HUD
 -- ======================================================================
@@ -673,6 +899,7 @@ local function drawHUD()
 			("SSR [R] %s   %d steps, %.1f units%s"):format(S.ssr and "ON " or "off", S.ssrSteps, S.ssrDist,
 				S.rtRefl and "   [F4] RAY TRACED" or ""),
 			shaders.light_hw and "T    toggle all ray-traced passes" or "",
+			("N    denoise: %s   (motion-stable temporal + spatial)"):format(S.dnDeferred and "ON" or "off"),
 			"",
 			"0-8  view modes      TAB  path-traced reference",
 			"C    A/B wipe (mouse x)   O  auto orbit",
@@ -768,6 +995,7 @@ function love.load(args)
 		if a == "--dn"    then S.pathTrace = true; S.denoise = true end
 		if a == "--anim"  then S.animate = true end
 		if a == "--rt"    then S.rtShadows = true; S.rtAO = true; S.rtRefl = true end
+		if a == "--rtdn"  then S.rtShadows = true; S.rtAO = true; S.rtRefl = true; S.dnDeferred = true end
 		if a == "--dnview" then S.dnView = tonumber(args[i + 1]) or 0 end
 		if a == "--orbit" then S.autoOrbit = true end
 		if a == "--bench" then benchFrames = tonumber(args[i + 1]) or 300 end
@@ -832,7 +1060,13 @@ function love.update(dt)
 	if ck ~= camKey or sk ~= setKey then
 		local cameraOnly = (sk == setKey)
 		camKey, setKey = ck, sk
-		if not (S.pathTrace and S.denoise and cameraOnly) then
+		if S.pathTrace and S.denoise and cameraOnly then
+			-- reprojection carries the history through camera motion
+		elseif S.dnDeferred and not S.pathTrace and cameraOnly then
+			-- the denoiser history reprojects; the accumulation buffers that
+			-- still feed the GI gather and SSR do not, so only those reset
+			resetAccumBuffers()
+		else
 			resetAccum()
 		end
 	end
@@ -854,14 +1088,23 @@ function love.draw()
 		local prev = cv.acc[cv.accIndex]
 		local cur  = cv.acc[3 - cv.accIndex]
 
+		local dn = S.dnDeferred and shaders.reproject_def
+
 		passGBuffer()
+		if dn then passGuidePack(); passRemodHist() end
 		passSSAO()
+		if dn then passAOTemporal() end   -- stabilized AO feeds the light pass
 		passLight(prev)
 		passSSR(prev)
 		passAccum(prev, cur)
 
+		local dnTex, dnSSR = nil, nil
+		if dn then
+			dnTex, dnSSR = passDeferredDenoise()
+		end
+
 		love.graphics.setBlendMode("alpha")
-		passComposite(cur)
+		passComposite(cur, dnTex, dnSSR)
 
 		cv.accIndex = 3 - cv.accIndex
 	end
@@ -914,6 +1157,8 @@ function love.keypressed(k)
 		if S.pathTrace then
 			S.denoise = not S.denoise
 			resetAccum()
+		else
+			S.dnDeferred = not S.dnDeferred
 		end
 	elseif k == "v" then
 		if S.pathTrace and S.denoise then
